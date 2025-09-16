@@ -1,0 +1,5 @@
+TOTAL_TAGS,BINARY_LENGTH,total_protocol_time_us,total_reader_bits,total_tag_bits,throughput_tags_per_sec,collision_slots,success_slots,idle_slots,algorithm_name,run_id
+100,96,15000,20000,50000,6666,10,100,5,Algorithm_A,1
+100,96,12000,18000,45000,8333,5,100,2,Algorithm_B,1
+200,96,32000,45000,110000,6250,25,200,10,Algorithm_A,1
+200,96,25000,38000,95000,8000,12,200,4,Algorithm_B,1
