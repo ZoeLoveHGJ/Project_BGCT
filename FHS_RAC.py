@@ -2,11 +2,9 @@ from typing import List, Set, Dict
 
 
 from Framework import TraditionalAlgorithmInterface, AlgorithmStepResult, Tag, CONSTANTS
-from Tool import RfidUtils
 
 
 class FHS_RAC(TraditionalAlgorithmInterface):
-
     def __init__(self, tags_in_field: List[Tag], **kwargs):
         super().__init__(tags_in_field, **kwargs)
 
@@ -14,131 +12,111 @@ class FHS_RAC(TraditionalAlgorithmInterface):
 
         self.collision_factor_threshold: float = 0.75
 
-        self.tag_response_counts: Dict[str, int] = {
-            tag.id: 0 for tag in self.tags_in_field}
-
-        self.metrics_finalized: bool = False
+        self.metrics['total_tag_responses'] = 0
 
     def is_finished(self) -> bool:
-        all_identified = len(self.identified_tags) == len(self.tags_in_field)
-        finished = not self.query_stack and all_identified
-
-        if finished and not self.metrics_finalized:
-            total_responses = sum(self.tag_response_counts.values())
-            num_tags = len(self.tags_in_field)
-            self.metrics['avg_tag_responses'] = total_responses / \
-                num_tags if num_tags > 0 else 0
-            self.metrics_finalized = True
-
-        return finished
+        """
+        判断算法是否结束：栈为空且所有标签被识别
+        """
+        return len(self.query_stack) == 0 and len(self.identified_tags) == len(self.tags_in_field)
 
     def perform_step(self) -> AlgorithmStepResult:
+        """
+        执行一个时隙的仿真步骤
+        """
+
         if not self.query_stack:
-            if not self.is_finished():
-                print(
-                    f"警告: FHS_RAC 查询栈已空，但仍有 {self.get_active_tag_count()} 个标签未识别。")
             return AlgorithmStepResult(operation_type='internal_op')
 
         current_prefix = self.query_stack.pop(0)
+        reader_bits_sent = CONSTANTS.READER_CMD_BASE_BITS + len(current_prefix)
 
-        matching_tags = [
+        candidates = [
             tag for tag in self.tags_in_field
             if tag.id not in self.identified_tags and tag.id.startswith(current_prefix)
         ]
 
-        for tag in matching_tags:
-            self.tag_response_counts[tag.id] += 1
+        active_tags = self.channel.filter_active_tags(candidates)
 
-        num_matching = len(matching_tags)
-        reader_bits_sent = CONSTANTS.READER_CMD_BASE_BITS + len(current_prefix)
+        self.metrics['total_tag_responses'] += len(active_tags)
 
         current_internal_metrics = {'stack_depth': len(self.query_stack)}
 
-        if num_matching == 0:
+        start_pos = len(current_prefix)
+
+        signal_str, collision_indices = self.channel.resolve_collision(
+            active_tags, bit_range=(start_pos, None))
+
+        if not active_tags:
             self.metrics['idle_slots'] += 1
             return AlgorithmStepResult(
                 operation_type='idle_slot',
                 reader_bits=reader_bits_sent,
-                operation_description=f"查询 '{current_prefix}...': 空闲",
+                operation_description=f"Query '{current_prefix}': Idle",
                 internal_metrics=current_internal_metrics
             )
 
-        elif num_matching == 1:
-            identified_tag = matching_tags[0]
-            self.identified_tags.add(identified_tag.id)
+        elif len(collision_indices) == 0:
             self.metrics['success_slots'] += 1
 
-            remaining_id_len = len(identified_tag.id) - len(current_prefix)
-            tag_bits_sent = CONSTANTS.RN16_RESPONSE_BITS + remaining_id_len
-
-            return AlgorithmStepResult(
-                operation_type='success_slot',
-                reader_bits=reader_bits_sent,
-                tag_bits=tag_bits_sent,
-                expected_max_tag_bits=tag_bits_sent,
-                operation_description=f"查询 '{current_prefix}...': 成功识别 {identified_tag.id[:15]}...",
-                internal_metrics=current_internal_metrics
-            )
-
-        else:
-            self.metrics['collision_slots'] += 1
-
-            colliding_ids = [tag.id for tag in matching_tags]
-            lcp, collision_positions = RfidUtils.get_collision_info(
-                colliding_ids)
-
-            if not collision_positions:
-                identified_tag = matching_tags[0]
+            if active_tags:
+                identified_tag = active_tags[0]
                 self.identified_tags.add(identified_tag.id)
-                self.metrics['success_slots'] += 1
-                self.metrics['collision_slots'] -= 1
-                remaining_id_len = len(identified_tag.id) - len(current_prefix)
+
+                remaining_id_len = len(signal_str)
                 tag_bits_sent = CONSTANTS.RN16_RESPONSE_BITS + remaining_id_len
+
                 return AlgorithmStepResult(
                     operation_type='success_slot',
                     reader_bits=reader_bits_sent,
                     tag_bits=tag_bits_sent,
                     expected_max_tag_bits=tag_bits_sent,
-                    operation_description=f"查询 '{current_prefix}...': 检测到无法分裂的碰撞，强制识别一个",
+                    operation_description=f"Query '{current_prefix}': Success ({identified_tag.id[-4:]})",
                     internal_metrics=current_internal_metrics
                 )
+            else:
+
+                return AlgorithmStepResult(operation_type='internal_op')
+
+        else:
+            self.metrics['collision_slots'] += 1
+
+            alpha = len(collision_indices)
+
+            beta = len(signal_str)
+
+            collision_factor = alpha / beta if beta > 0 else 0
 
             is_highest_bit_continuous = False
-            if len(collision_positions) >= 2 and collision_positions[0] + 1 == collision_positions[1]:
-                is_highest_bit_continuous = True
+            if len(collision_indices) >= 2:
 
-            alpha = len(collision_positions)
-            beta = len(colliding_ids[0]) - len(current_prefix)
-            collision_factor = alpha / beta if beta > 0 else 0
+                if collision_indices[1] == collision_indices[0] + 1:
+                    is_highest_bit_continuous = True
 
             use_4_ary = is_highest_bit_continuous and (
                 collision_factor > self.collision_factor_threshold)
 
-            split_base = lcp
+            split_base = current_prefix
 
             if use_4_ary:
                 new_suffixes = ['00', '01', '10', '11']
-                split_len = 2
+                strategy_name = "4-ary"
             else:
                 new_suffixes = ['0', '1']
-                split_len = 1
+                strategy_name = "2-ary"
 
             for suffix in reversed(new_suffixes):
                 self.query_stack.insert(0, split_base + suffix)
 
-            current_internal_metrics = {'stack_depth': len(self.query_stack)}
+            current_internal_metrics['stack_depth'] = len(self.query_stack)
 
-            tag_bits_in_collision = len(
-                split_base) + split_len - len(current_prefix)
+            tag_bits_in_collision = len(signal_str)
 
             return AlgorithmStepResult(
                 operation_type='collision_slot',
                 reader_bits=reader_bits_sent,
                 tag_bits=tag_bits_in_collision,
                 expected_max_tag_bits=tag_bits_in_collision,
-                operation_description=f"查询 '{current_prefix}...': {num_matching}个标签碰撞，分裂为 {'4-ary' if use_4_ary else '2-ary'}",
+                operation_description=f"Query '{current_prefix}': Coll(μ={collision_factor:.2f}, {strategy_name})",
                 internal_metrics=current_internal_metrics
             )
-
-    def get_results(self) -> Set[str]:
-        return self.identified_tags

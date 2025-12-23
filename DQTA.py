@@ -4,49 +4,33 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
-
 from Framework import (
     TraditionalAlgorithmInterface,
     AlgorithmStepResult,
     Tag,
-    CONSTANTS,
-    apply_ber_noise
+    CONSTANTS
 )
-
-
-class RfidUtils:
-    @staticmethod
-    def get_collision_info(tag_ids: List[str]) -> (str, List[int]):
-        if not tag_ids:
-            return "", []
-        min_len = min(len(tid) for tid in tag_ids)
-        common_prefix = ""
-        for i in range(min_len):
-            char = tag_ids[0][i]
-            if all(tid[i] == char for tid in tag_ids):
-                common_prefix += char
-            else:
-                break
-        return common_prefix, []
 
 
 @dataclass
 class DQTAState:
-    """用于在主堆栈中存储待处理的标签集合。"""
     tags_to_identify: List[Tag] = field(default_factory=list)
 
 
 class DQTAAlgorithm(TraditionalAlgorithmInterface):
-    """DQTA 算法的复现实现 - V2 适配版"""
-
     def __init__(self, tags_in_field: List[Tag], **kwargs):
-        super().__init__(tags_in_field)
+        super().__init__(tags_in_field, **kwargs)
+
         self.k_max = kwargs.get('k_max', 3)
         initial_state = DQTAState(tags_to_identify=self.tags_in_field)
         self.query_stack: List[DQTAState] = [initial_state]
         self.id_length = len(tags_in_field[0].id) if tags_in_field else 0
+
+        self.metrics['total_tag_responses'] = 0
+
         self.tag_response_counts: Dict[str, int] = {
             t.id: 0 for t in tags_in_field}
+
         self.current_mode = 'PLANNING_PHASE'
         self.tags_for_planning: List[Tag] = []
         self.planned_groups: List[List[Tag]] = []
@@ -60,30 +44,18 @@ class DQTAAlgorithm(TraditionalAlgorithmInterface):
             'enable_resource_monitoring', False)
 
     def _create_step_result(self, *args, **kwargs) -> AlgorithmStepResult:
-        """
-        V2 新增: 辅助函数，用于统一创建 AlgorithmStepResult 对象。
-        如果资源监控开启，此函数会自动附加内部状态指标。
-        """
         result = AlgorithmStepResult(*args, **kwargs)
         if self.enable_monitoring:
             result.internal_metrics = {'stack_depth': len(self.query_stack)}
         return result
 
-    def _get_consecutive_collision_info(self, tag_ids: List[str], prefix_len: int) -> int:
-        """DQTA的核心辅助函数：检测第一个碰撞位之后连续的碰撞位数。"""
-        if len(tag_ids) <= 1:
+    def _get_consecutive_collision_info(self, signal: str, start_index: int) -> int:
+        if start_index >= len(signal):
             return 0
-        id_len = len(tag_ids[0])
-        first_coll_pos = -1
-        for i in range(prefix_len, id_len):
-            if len(set(tag[i] for tag in tag_ids)) > 1:
-                first_coll_pos = i
-                break
-        if first_coll_pos == -1:
-            return 0
-        k_detected = 1
-        for i in range(first_coll_pos + 1, id_len):
-            if len(set(tag[i] for tag in tag_ids)) > 1:
+
+        k_detected = 0
+        for i in range(start_index, len(signal)):
+            if signal[i] == 'X':
                 k_detected += 1
             else:
                 break
@@ -91,48 +63,87 @@ class DQTAAlgorithm(TraditionalAlgorithmInterface):
 
     def is_finished(self) -> bool:
         finished = len(self.identified_tags) == len(self.tags_in_field)
+
         if finished and 'avg_tag_responses' not in self.metrics:
-            counts = list(self.tag_response_counts.values())
-            self.metrics['avg_tag_responses'] = np.mean(
-                counts) if counts else 0
+            total_tags = len(self.tags_in_field)
+            if total_tags > 0:
+                self.metrics['avg_tag_responses'] = self.metrics['total_tag_responses'] / total_tags
+            else:
+                self.metrics['avg_tag_responses'] = 0
         return finished
 
     def perform_step(self) -> AlgorithmStepResult:
+
         if self.current_mode == 'PLANNING_PHASE':
             if not self.query_stack:
                 return self._create_step_result('internal_op', operation_description="Finished")
 
             current_state = self.query_stack.pop(0)
-            tags = [
+            candidate_tags = [
                 t for t in current_state.tags_to_identify if t.id not in self.identified_tags]
 
-            if not tags:
+            if not candidate_tags:
                 return self._create_step_result('internal_op', operation_description="Empty state popped")
 
-            common_prefix, _ = RfidUtils.get_collision_info(
-                [t.id for t in tags])
+            active_tags = self.channel.filter_active_tags(candidate_tags)
 
-            if len(tags) == 1:
-                tag = tags[0]
-                self.identified_tags.add(tag.id)
-                self.metrics['success_slots'] += 1
-                self.tag_response_counts[tag.id] += 1
-                reader_bits = CONSTANTS.READER_CMD_BASE_BITS + \
-                    len(common_prefix)
-                tag_bits = self.id_length - len(common_prefix)
-                return self._create_step_result('success_slot', reader_bits, tag_bits, tag_bits)
+            if not active_tags:
+                self.metrics['idle_slots'] += 1
 
-            self.tags_for_planning = tags
+                self.query_stack.insert(0, DQTAState(
+                    tags_to_identify=candidate_tags))
+                return self._create_step_result('idle_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS)
+
+            self.metrics['total_tag_responses'] += len(active_tags)
+            for t in active_tags:
+                self.tag_response_counts[t.id] += 1
+
+            signal, _ = self.channel.resolve_collision(active_tags)
+
+            if len(active_tags) == 1:
+                tag = active_tags[0]
+
+                if 'X' in signal:
+                    self.query_stack.insert(0, DQTAState(
+                        tags_to_identify=candidate_tags))
+                    self.metrics['collision_slots'] += 1
+                    return self._create_step_result('collision_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
+                                                    tag_bits=self.id_length, expected_max_tag_bits=self.id_length)
+
+                if signal == tag.id:
+                    self.identified_tags.add(tag.id)
+                    self.metrics['success_slots'] += 1
+                    return self._create_step_result('success_slot',
+                                                    reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
+                                                    tag_bits=self.id_length,
+                                                    expected_max_tag_bits=self.id_length)
+                else:
+
+                    self.query_stack.insert(0, DQTAState(
+                        tags_to_identify=candidate_tags))
+                    self.metrics['collision_slots'] += 1
+                    return self._create_step_result('collision_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
+                                                    tag_bits=self.id_length, expected_max_tag_bits=self.id_length)
+
+            self.tags_for_planning = active_tags
             self.current_mode = 'AWAITING_PLANNING_DATA'
 
-            self.metrics['collision_slots'] += 1
-            for tag in self.tags_for_planning:
-                self.tag_response_counts[tag.id] += 1
+            try:
+                prefix_len = signal.index('X')
+            except ValueError:
+                prefix_len = len(signal)
 
-            prefix_len = len(common_prefix)
+            if prefix_len == len(signal):
+                self.query_stack.insert(
+                    0, DQTAState(tags_to_identify=active_tags))
+                self.metrics['collision_slots'] += 1
+                return self._create_step_result('collision_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
+                                                tag_bits=len(active_tags)*self.id_length, expected_max_tag_bits=self.id_length)
+
+            self.metrics['collision_slots'] += 1
             remaining_len = self.id_length - prefix_len
             reader_bits_cost = CONSTANTS.READER_CMD_BASE_BITS + prefix_len
-            tag_bits_cost = len(tags) * remaining_len
+            tag_bits_cost = len(active_tags) * remaining_len
 
             return self._create_step_result('collision_slot',
                                             reader_bits=reader_bits_cost,
@@ -142,54 +153,71 @@ class DQTAAlgorithm(TraditionalAlgorithmInterface):
 
         elif self.current_mode == 'AWAITING_PLANNING_DATA':
             tags = self.tags_for_planning
-            tag_ids = [t.id for t in tags]
-            common_prefix, _ = RfidUtils.get_collision_info(tag_ids)
-            prefix_len = len(common_prefix)
+
+            signal, _ = self.channel.resolve_collision(tags)
+            try:
+                prefix_len = signal.index('X')
+            except ValueError:
+                prefix_len = len(signal)
 
             k_detected = self._get_consecutive_collision_info(
-                tag_ids, prefix_len)
+                signal, prefix_len)
             k_to_use = min(k_detected, self.k_max)
             if k_to_use == 0:
                 k_to_use = 1
 
             groups = [[] for _ in range(2**k_to_use)]
             for tag in tags:
-                feature_vector = tag.id[prefix_len: prefix_len + k_to_use]
-                group_index = int(feature_vector, 2)
-                groups[group_index].append(tag)
+                if prefix_len + k_to_use <= self.id_length:
+                    feature_vector = tag.id[prefix_len: prefix_len + k_to_use]
+                    group_index = int(feature_vector, 2)
+                    groups[group_index].append(tag)
+                else:
+                    groups[0].append(tag)
 
             self.planned_groups = groups
             self.sub_slot_cursor = 0
             self.current_split_prefix_len = prefix_len
             self.current_k_to_use = k_to_use
-            self.pending_cmd_reader_bits = CONSTANTS.READER_CMD_BASE_BITS + prefix_len + 3
+            self.pending_cmd_reader_bits = CONSTANTS.READER_CMD_BASE_BITS + prefix_len + k_to_use
 
             self.current_mode = 'EXECUTING_PHASE'
             return self._create_step_result('internal_op', operation_description=f"Planned DQTA Query, k={k_to_use}")
 
         elif self.current_mode == 'EXECUTING_PHASE':
-            group = self.planned_groups[self.sub_slot_cursor]
+            candidate_group = self.planned_groups[self.sub_slot_cursor]
             self.sub_slot_cursor += 1
+
+            active_group = self.channel.filter_active_tags(candidate_group)
 
             remaining_id_len = self.id_length - \
                 self.current_split_prefix_len - self.current_k_to_use
+            if remaining_id_len < 0:
+                remaining_id_len = 0
+
             reader_bits_cost = self.pending_cmd_reader_bits
             self.pending_cmd_reader_bits = 0.0
 
-            if len(group) == 0:
+            if len(active_group) > 0:
+                self.metrics['total_tag_responses'] += len(active_group)
+                for t in active_group:
+                    self.tag_response_counts[t.id] += 1
+
+            if len(active_group) == 0:
                 self.metrics['idle_slots'] += 1
+                if len(candidate_group) > 0:
+                    self.query_stack.insert(0, DQTAState(
+                        tags_to_identify=candidate_group))
                 result = self._create_step_result(
                     'idle_slot', reader_bits=reader_bits_cost)
 
-            elif len(group) == 1:
-                tag = group[0]
-
+            elif len(active_group) == 1:
+                tag = active_group[0]
                 perfect_response = tag.id[self.id_length - remaining_id_len:]
+                received_response, _ = self.channel.resolve_collision(
+                    [tag], bit_range=(self.id_length - remaining_id_len, self.id_length))
 
-                noisy_response = apply_ber_noise(perfect_response, self.ber)
-
-                if perfect_response == noisy_response:
-
+                if perfect_response == received_response:
                     self.identified_tags.add(tag.id)
                     self.metrics['success_slots'] += 1
                     result = self._create_step_result('success_slot',
@@ -197,21 +225,20 @@ class DQTAAlgorithm(TraditionalAlgorithmInterface):
                                                       tag_bits=remaining_id_len,
                                                       expected_max_tag_bits=remaining_id_len)
                 else:
-
-                    self.query_stack.insert(
-                        0, DQTAState(tags_to_identify=group))
+                    self.query_stack.insert(0, DQTAState(
+                        tags_to_identify=active_group))
                     self.metrics['collision_slots'] += 1
-
-                    tag_bits_cost = remaining_id_len
                     result = self._create_step_result('collision_slot',
                                                       reader_bits=reader_bits_cost,
-                                                      tag_bits=tag_bits_cost,
+                                                      tag_bits=remaining_id_len,
                                                       expected_max_tag_bits=remaining_id_len,
-                                                      operation_description="Success slot failed due to BER")
+                                                      operation_description="Exec success slot failed due to BER")
+
             else:
-                self.query_stack.insert(0, DQTAState(tags_to_identify=group))
+                self.query_stack.insert(0, DQTAState(
+                    tags_to_identify=active_group))
                 self.metrics['collision_slots'] += 1
-                tag_bits_cost = len(group) * remaining_id_len
+                tag_bits_cost = len(active_group) * remaining_id_len
                 result = self._create_step_result('collision_slot',
                                                   reader_bits=reader_bits_cost,
                                                   tag_bits=tag_bits_cost,

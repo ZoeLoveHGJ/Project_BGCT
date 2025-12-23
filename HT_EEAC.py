@@ -1,106 +1,106 @@
 import random
 import math
-from dataclasses import dataclass
 from typing import List, Dict, Optional
 
-# 导入外部依赖和框架组件
+
 try:
     from scipy.special import lambertw
 except ImportError:
-    raise ImportError("本算法需要 `scipy` 库来计算朗伯W函数。请通过 `pip install scipy` 安装。")
+    raise ImportError("HT-EEAC error")
+
 
 from Framework import TraditionalAlgorithmInterface, AlgorithmStepResult, Tag, CONSTANTS
 
 
 class HT_EEAC(TraditionalAlgorithmInterface):
-    """
-    HT-EEAC 协议的仿真实现类。
-    """
-
     def __init__(self, tags_in_field: List[Tag], **kwargs):
         super().__init__(tags_in_field, **kwargs)
 
-        # 协议状态变量
-        self.q = 6  # 初始 Q=6 -> L=64
+        self.q = 4
         self.frame_size = 2**self.q
         self.slot_counter = 0
         self.unidentified_tags = list(self.tags_in_field)
 
-        # 当前帧的统计数据
-        self.frame_ni = 0  # 空闲时隙数
-        self.frame_ns = 0  # 成功时隙数
-        self.frame_nk = 0  # 碰撞时隙数
+        self.frame_ni = 0
+        self.frame_ns = 0
+        self.frame_nk = 0
+
         self.tags_in_slot: Dict[int, List[Tag]] = {}
 
-        # 协议特有参数
-        self.energy_threshold = 17.5  # 论文定义的能量阈值
-        self.checkpoint_divisor = 16  # 检查点为 L/16
+        self.energy_threshold = 17.5
+        self.checkpoint_divisor = 16
 
         self.r_factor = self._calculate_r()
 
-        self.tag_response_counts: Dict[str, int] = {
-            tag.id: 0 for tag in self.tags_in_field}
-        self.metrics_finalized: bool = False
+        self.metrics['total_tag_responses'] = 0
 
-        # 开始第一帧
         self._start_new_frame()
 
     def is_finished(self) -> bool:
         """当所有标签都已被识别时，仿真结束。"""
-        finished = not self.unidentified_tags
-
-        if finished and not self.metrics_finalized:
-            total_responses = sum(self.tag_response_counts.values())
-            num_tags = len(self.tags_in_field)
-            self.metrics['avg_tag_responses'] = total_responses / \
-                num_tags if num_tags > 0 else 0
-            self.metrics_finalized = True
-
-        return finished
+        return len(self.unidentified_tags) == 0
 
     def perform_step(self) -> AlgorithmStepResult:
         """
-        执行并仿真一个时隙的操作。
+        执行一个时隙的仿真。
         """
         if self.is_finished():
             return AlgorithmStepResult(operation_type='internal_op')
 
-        tags_in_current_slot = self.tags_in_slot.get(self.slot_counter, [])
-        num_tags_in_slot = len(tags_in_current_slot)
+        candidates = self.tags_in_slot.get(self.slot_counter, [])
+
+        active_tags = self.channel.filter_active_tags(candidates)
+
+        self.metrics['total_tag_responses'] += len(active_tags)
+
         current_internal_metrics = {
             'unidentified_tags_count': len(self.unidentified_tags)}
 
-        if num_tags_in_slot == 0:
+        signal_str, collision_indices = self.channel.resolve_collision(
+            active_tags)
+
+        step_result = None
+
+        if not active_tags:
             self.metrics['idle_slots'] += 1
             self.frame_ni += 1
             step_result = AlgorithmStepResult(
                 operation_type='idle_slot',
                 reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
-                operation_description=f"帧 {self.frame_size}, 时隙 {self.slot_counter}: 空闲",
-                internal_metrics=current_internal_metrics  # 上报状态
+                operation_description=f"Frame 2^{self.q}, Slot {self.slot_counter}: Idle",
+                internal_metrics=current_internal_metrics
             )
-        elif num_tags_in_slot == 1:
-            identified_tag = tags_in_current_slot[0]
-            self.identified_tags.add(identified_tag.id)
-            self.unidentified_tags.remove(identified_tag)
 
-            self.metrics['success_slots'] += 1
-            self.frame_ns += 1
-            tag_response_bits = CONSTANTS.RN16_RESPONSE_BITS + \
-                len(identified_tag.id)
+        elif len(collision_indices) == 0:
 
-            # 成功识别后，未识别标签数减少了，需要更新一次监控状态
-            current_internal_metrics['unidentified_tags_count'] = len(
-                self.unidentified_tags)
+            if active_tags:
+                identified_tag = active_tags[0]
 
-            step_result = AlgorithmStepResult(
-                operation_type='success_slot',
-                reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
-                tag_bits=tag_response_bits,
-                expected_max_tag_bits=tag_response_bits,
-                operation_description=f"帧 {self.frame_size}, 时隙 {self.slot_counter}: 成功识别",
-                internal_metrics=current_internal_metrics  # 上报状态
-            )
+                if identified_tag in self.unidentified_tags:
+                    self.identified_tags.add(identified_tag.id)
+                    self.unidentified_tags.remove(identified_tag)
+
+                    current_internal_metrics['unidentified_tags_count'] = len(
+                        self.unidentified_tags)
+
+                self.metrics['success_slots'] += 1
+                self.frame_ns += 1
+
+                tag_response_bits = CONSTANTS.RN16_RESPONSE_BITS + \
+                    len(signal_str)
+
+                step_result = AlgorithmStepResult(
+                    operation_type='success_slot',
+                    reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
+                    tag_bits=tag_response_bits,
+                    expected_max_tag_bits=tag_response_bits,
+                    operation_description=f"Frame 2^{self.q}, Slot {self.slot_counter}: Success",
+                    internal_metrics=current_internal_metrics
+                )
+            else:
+
+                step_result = AlgorithmStepResult(operation_type='internal_op')
+
         else:
             self.metrics['collision_slots'] += 1
             self.frame_nk += 1
@@ -109,40 +109,51 @@ class HT_EEAC(TraditionalAlgorithmInterface):
                 reader_bits=CONSTANTS.READER_CMD_BASE_BITS,
                 tag_bits=CONSTANTS.RN16_RESPONSE_BITS,
                 expected_max_tag_bits=CONSTANTS.RN16_RESPONSE_BITS,
-                operation_description=f"帧 {self.frame_size}, 时隙 {self.slot_counter}: {num_tags_in_slot} 个标签碰撞",
-                internal_metrics=current_internal_metrics  # 上报状态
+                operation_description=f"Frame 2^{self.q}, Slot {self.slot_counter}: Collision",
+                internal_metrics=current_internal_metrics
             )
 
         self.slot_counter += 1
-        checkpoint_slot = self.frame_size / self.checkpoint_divisor
 
+        checkpoint_slot = self.frame_size / self.checkpoint_divisor
         is_checkpoint = (checkpoint_slot >=
                          1 and self.slot_counter == int(checkpoint_slot))
-        is_frame_end = (self.slot_counter == self.frame_size)
+        is_frame_end = (self.slot_counter >= self.frame_size)
 
-        if (is_checkpoint or is_frame_end):
+        if (is_checkpoint or is_frame_end) and not self.is_finished():
+
             e_per_ns = self._calculate_e_per_ns()
 
-            if (e_per_ns is not None and e_per_ns > self.energy_threshold and not is_frame_end) or is_frame_end:
-                if not self.is_finished():
-                    estimated_tags = self._mmse_estimate(
-                        self.frame_ni, self.frame_ns, self.frame_nk, self.frame_size)
-                    n_next = max(0, estimated_tags - self.frame_ns)
+            should_terminate = False
+            if is_frame_end:
+                should_terminate = True
+            elif e_per_ns is not None and e_per_ns > self.energy_threshold:
 
-                    if n_next > 0 and self.r_factor > 0:
-                        log_arg = n_next / self.r_factor
-                        self.q = round(math.log2(log_arg)
-                                       ) if log_arg > 0 else 0
-                        self.q = max(0, min(15, self.q))
-                    else:
-                        self.q = 2 if self.unidentified_tags else 0
+                should_terminate = True
 
-                    self.frame_size = 2**self.q
-                    self._start_new_frame()
+            if should_terminate:
+
+                estimated_total = self._mmse_estimate(
+                    self.frame_ni, self.frame_ns, self.frame_nk, self.frame_size)
+
+                n_next = max(0, estimated_total - self.frame_ns)
+
+                if n_next > 0 and self.r_factor > 0:
+                    log_arg = n_next / self.r_factor
+
+                    next_q = round(math.log2(log_arg)) if log_arg > 0 else 0
+                    self.q = max(0, min(15, next_q))
+                else:
+
+                    self.q = 2 if self.unidentified_tags else 0
+
+                self.frame_size = 2**self.q
+                self._start_new_frame()
 
         return step_result
 
     def _start_new_frame(self):
+        """初始化一个新帧，重置计数器并让未识别标签随机选择时隙。"""
         self.slot_counter = 0
         self.frame_ni, self.frame_ns, self.frame_nk = 0, 0, 0
         self.tags_in_slot.clear()
@@ -150,11 +161,9 @@ class HT_EEAC(TraditionalAlgorithmInterface):
         if self.is_finished():
             return
 
-        for tag in self.unidentified_tags:
-            self.tag_response_counts[tag.id] += 1
-
         if self.frame_size == 0:
-            return
+
+            self.frame_size = 1
 
         for tag in self.unidentified_tags:
             chosen_slot = random.randint(0, self.frame_size - 1)
@@ -164,11 +173,14 @@ class HT_EEAC(TraditionalAlgorithmInterface):
 
     def _get_slot_durations_us(self):
         """使用框架常量计算HT-EEAC论文中定义的时隙时长"""
+
         ti_us = CONSTANTS.T1_US * 2
+
         ts_us = (CONSTANTS.READER_CMD_BASE_BITS / CONSTANTS.READER_BITS_PER_US +
                  CONSTANTS.T1_US +
                  (CONSTANTS.RN16_RESPONSE_BITS + CONSTANTS.EPC_CODE_BITS) / CONSTANTS.TAG_BITS_PER_US +
                  CONSTANTS.T2_MIN_US)
+
         tk_us = (CONSTANTS.READER_CMD_BASE_BITS / CONSTANTS.READER_BITS_PER_US +
                  CONSTANTS.T1_US +
                  CONSTANTS.RN16_RESPONSE_BITS / CONSTANTS.TAG_BITS_PER_US +
@@ -215,6 +227,7 @@ class HT_EEAC(TraditionalAlgorithmInterface):
     def _mmse_estimate(self, ni: int, ns: int, nk: int, L: int) -> int:
         """根据论文 Eq. (14) 实现 MMSE 标签数量估算。"""
         min_error = float('inf')
+
         best_n = ns + 2 * nk
         search_range = 100
 
@@ -226,6 +239,7 @@ class HT_EEAC(TraditionalAlgorithmInterface):
                 continue
 
             try:
+
                 p_idle = (1 - 1/L)**n_hat if n_hat > 0 else 1.0
                 p_success = n_hat * (1/L) * ((1 - 1/L) **
                                              (n_hat - 1)) if n_hat > 0 else 0.0

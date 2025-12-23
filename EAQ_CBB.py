@@ -1,212 +1,290 @@
-
 import math
-import random
 import numpy as np
+import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 from Framework import (
     TraditionalAlgorithmInterface,
     AlgorithmStepResult,
     Tag,
-    CONSTANTS,
-    apply_ber_noise
+    CONSTANTS
 )
-from Tool import RfidUtils
 
 
 @dataclass
-class EAQTask:
-    """用于在主堆栈中存储待处理的标签集合"""
-    tags_to_process: List[Tag]
+class EAQState:
+    """EAQ 任务状态: 保存当前查询前缀及对应的标签子集"""
+    prefix: str = ""
+    tags_in_subset: List[Tag] = field(default_factory=list)
 
 
 class EAQCBBAlgorithm(TraditionalAlgorithmInterface):
-    """EAQ-CBB 算法的复现实现 - V2 适配版"""
 
     def __init__(self, tags_in_field: List[Tag], **kwargs):
-        super().__init__(tags_in_field)
+        super().__init__(tags_in_field, **kwargs)
 
-        self.s_opt_ratio = kwargs.get('s_opt_ratio', 0.25)
-        self.b_l = kwargs.get('b_l', 3)
+        self.M_tpe = kwargs.get('M_tpe', 96)
+        self.b_l_max = kwargs.get('b_l', 3)
 
-        self.current_mode = 'INITIAL_PARTITIONING'
-        self.task_stack: List[EAQTask] = []
+        self.state = 'TPE_PHASE'
+        self.s_opt = 1
+        self.partition_queue: List[List[Tag]] = []
+        self.task_stack: List[EAQState] = []
 
-        self.qtcbb_task: EAQTask = None
-        self.qtcbb_prefix = ""
-        self.qtcbb_b_i = 0
-        self.qtcbb_b_l = 0
+        self.total_tag_count = len(tags_in_field)
+        self.id_length = len(tags_in_field[0].id) if tags_in_field else 96
 
-        self.id_length = len(tags_in_field[0].id) if tags_in_field else 0
+        self.metrics['total_tag_responses'] = 0
+
         self.tag_response_counts: Dict[str, int] = {
             t.id: 0 for t in tags_in_field}
 
-        self.ber = kwargs.get('ber', 0.0)
         self.enable_monitoring = kwargs.get(
             'enable_resource_monitoring', False)
 
     def _create_step_result(self, *args, **kwargs) -> AlgorithmStepResult:
-        """
-        V2 新增: 辅助函数，用于统一创建 AlgorithmStepResult 对象。
-        如果资源监控开启，此函数会自动附加内部状态指标。
-        """
+        """辅助函数：封装步骤结果并注入监控指标"""
         result = AlgorithmStepResult(*args, **kwargs)
         if self.enable_monitoring:
-            result.internal_metrics = {'stack_depth': len(self.task_stack)}
+
+            depth = len(self.task_stack) + len(self.partition_queue)
+            result.internal_metrics = {'stack_depth': depth}
         return result
 
     def is_finished(self) -> bool:
-        finished = len(self.identified_tags) == len(self.tags_in_field)
-        if finished and 'avg_tag_responses' not in self.metrics:
-            counts = list(self.tag_response_counts.values())
-            self.metrics['avg_tag_responses'] = np.mean(
-                counts) if counts else 0
-        return finished
+        """判断算法是否结束"""
+        finished = len(self.identified_tags) == self.total_tag_count
+        if finished:
+            return True
 
-    def _get_collided_block_info(self, tag_ids: List[str], prefix: str) -> Tuple[int, int]:
-        """获取第一个碰撞位(b_i)和连续碰撞块长度(b_l)"""
-        prefix_len = len(prefix)
-        if len(tag_ids) <= 1:
-            return -1, 0
-        id_len = len(tag_ids[0])
-        b_i = -1
-        for i in range(prefix_len, id_len):
-            if len(set(tag[i] for tag in tag_ids)) > 1:
-                b_i = i
-                break
-        if b_i == -1:
-            return -1, 0
-        b_l = 1
-        for i in range(b_i + 1, id_len):
-            if len(set(tag[i] for tag in tag_ids)) > 1:
-                b_l += 1
-            else:
-                break
-        return b_i, b_l
+        if not self.task_stack and not self.partition_queue:
+            remaining = [
+                t for t in self.tags_in_field if t.id not in self.identified_tags]
+            if remaining:
+
+                self.task_stack.append(
+                    EAQState(prefix="", tags_in_subset=remaining))
+                return False
+        return False
 
     def perform_step(self) -> AlgorithmStepResult:
-        if self.is_finished():
-            return self._create_step_result('internal_op', operation_description="All tags identified.")
+        """主状态机执行一步"""
 
-        if self.current_mode == 'INITIAL_PARTITIONING':
-            n_hat = len(self.tags_in_field)
-            s_opt = max(1, math.ceil(self.s_opt_ratio * n_hat))
-            partitions = [[] for _ in range(s_opt)]
+        if self.state == 'TPE_PHASE':
+            active_tags = self.channel.filter_active_tags(self.tags_in_field)
+
+            if not active_tags:
+
+                self.s_opt = 1
+                self.state = 'PARTITIONING'
+                return self._create_step_result('internal_op', operation_description="TPE: No tags")
+
+            tpe_responses = []
+            for tag in active_tags:
+
+                self.tag_response_counts[tag.id] += 1
+                self.metrics['total_tag_responses'] += 1
+
+                bits = ['1'] * self.M_tpe
+                idx = random.randint(0, self.M_tpe - 1)
+                bits[idx] = '0'
+                tpe_responses.append("".join(bits))
+
+            mixed_signal, _ = self.channel.resolve_collision_raw_strings(
+                tpe_responses)
+
+            c_u = 0
+            for char in mixed_signal:
+                if char != 'X':
+                    c_u += 1
+
+            try:
+                if c_u == 0:
+                    c_u = 0.001
+                term1 = math.log(c_u / self.M_tpe)
+                term2 = math.log(1 - 1.0 / self.M_tpe)
+                n_hat = math.ceil(term1 / term2)
+            except:
+                n_hat = len(active_tags)
+
+            n_hat = max(1, int(n_hat))
+
+            self.s_opt = max(1, int(0.25 * n_hat))
+
+            reader_bits = 8
+
+            total_tag_bits = len(active_tags) * self.M_tpe
+
+            t_reader = reader_bits / CONSTANTS.READER_BITS_PER_US
+            t_tag = self.M_tpe / CONSTANTS.TAG_BITS_PER_US
+            time_us = t_reader + CONSTANTS.T1_US + t_tag + CONSTANTS.T2_MIN_US
+
+            self.state = 'PARTITIONING'
+            return self._create_step_result('internal_op', reader_bits, total_tag_bits,
+                                            override_time_us=time_us, operation_description=f"TPE: est={n_hat}, S={self.s_opt}")
+
+        if self.state == 'PARTITIONING':
+
+            partitions = [[] for _ in range(self.s_opt)]
+
             for tag in self.tags_in_field:
-                partitions[random.randint(0, s_opt - 1)].append(tag)
+                slot_idx = random.randint(0, self.s_opt - 1)
+                partitions[slot_idx].append(tag)
 
-            for p in reversed(partitions):
-                if p:
-                    self.task_stack.append(EAQTask(tags_to_process=p))
+            for p_tags in partitions:
+                if not p_tags:
 
-            self.current_mode = 'PROCESSING_PARTITIONS'
-            return self._create_step_result('internal_op', operation_description=f"Partitioned into {s_opt} groups.")
-
-        elif self.current_mode == 'PROCESSING_PARTITIONS':
-            if not self.task_stack:
-                return self._create_step_result('internal_op', operation_description="All tasks finished.")
-
-            task = self.task_stack.pop(0)
-            tags = [
-                t for t in task.tags_to_process if t.id not in self.identified_tags]
-
-            if not tags:
-                self.metrics['idle_slots'] += 1
-                return self._create_step_result('idle_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS)
-
-            common_prefix, _ = RfidUtils.get_collision_info(
-                [t.id for t in tags])
-
-            if len(tags) == 1:
-                tag = tags[0]
-                self.tag_response_counts[tag.id] += 1
-
-                remaining_len = self.id_length - len(common_prefix)
-                perfect_response = tag.id[len(common_prefix):]
-                noisy_response = apply_ber_noise(perfect_response, self.ber)
-
-                reader_bits = CONSTANTS.READER_CMD_BASE_BITS + \
-                    len(common_prefix)
-
-                if perfect_response == noisy_response:
-                    self.identified_tags.add(tag.id)
-                    self.metrics['success_slots'] += 1
-                    return self._create_step_result('success_slot', reader_bits, remaining_len, remaining_len)
+                    self.metrics['idle_slots'] += 1
                 else:
-                    self.task_stack.insert(0, EAQTask(tags_to_process=tags))
+                    self.partition_queue.append(p_tags)
+
+            reader_bits = 64
+            t_reader = reader_bits / CONSTANTS.READER_BITS_PER_US
+            time_us = t_reader + CONSTANTS.T1_US
+
+            self.state = 'PROCESSING'
+            return self._create_step_result('internal_op', reader_bits, 0,
+                                            override_time_us=time_us, operation_description="Partitioning")
+
+        if self.state == 'PROCESSING':
+
+            if not self.task_stack:
+                if self.partition_queue:
+                    next_group = self.partition_queue.pop(0)
+                    self.task_stack.append(
+                        EAQState(prefix="", tags_in_subset=next_group))
+                else:
+
+                    return self._create_step_result('internal_op')
+
+            current_state = self.task_stack.pop(0)
+            prefix = current_state.prefix
+
+            candidates = [
+                t for t in current_state.tags_in_subset if t.id not in self.identified_tags]
+
+            active_tags = self.channel.filter_active_tags(candidates)
+
+            for t in active_tags:
+                self.tag_response_counts[t.id] += 1
+                self.metrics['total_tag_responses'] += 1
+
+            reader_bits = CONSTANTS.READER_CMD_BASE_BITS + len(prefix)
+
+            if not active_tags:
+                self.metrics['idle_slots'] += 1
+                return self._create_step_result('idle_slot', reader_bits, 0, 0)
+
+            payloads = [t.id[len(prefix):] for t in active_tags]
+
+            if payloads and len(payloads[0]) == 0:
+                for t in active_tags:
+                    self.identified_tags.add(t.id)
+                self.metrics['success_slots'] += 1
+                return self._create_step_result('success_slot', reader_bits, 0, 0)
+
+            observed_signal, collision_indices = self.channel.resolve_collision_raw_strings(
+                payloads)
+            total_tag_bits = sum(len(p) for p in payloads)
+            response_len = len(payloads[0])
+
+            if not collision_indices:
+                matched_suffix = observed_signal
+
+                full_id_candidates = [
+                    t for t in active_tags if t.id[len(prefix):] == matched_suffix]
+
+                if len(full_id_candidates) == 1:
+                    self.identified_tags.add(full_id_candidates[0].id)
+                    self.metrics['success_slots'] += 1
+                    return self._create_step_result('success_slot', reader_bits, total_tag_bits, response_len)
+                else:
+
                     self.metrics['collision_slots'] += 1
-                    return self._create_step_result('collision_slot', reader_bits, remaining_len, remaining_len,
-                                                    operation_description="Success slot failed due to BER")
+                    self.task_stack.insert(0, current_state)
+                    return self._create_step_result('collision_slot', reader_bits, total_tag_bits, response_len,
+                                                    operation_description="Hidden Collision")
 
-            self.qtcbb_task = EAQTask(tags_to_process=tags)
-            self.qtcbb_prefix = common_prefix
-            self.current_mode = 'QTCBB_GET_BLOCK_INFO'
-            return self.perform_step()
+            else:
 
-        elif self.current_mode == 'QTCBB_GET_BLOCK_INFO':
-            tags = self.qtcbb_task.tags_to_process
-            prefix_len = len(self.qtcbb_prefix)
-            remaining_len = self.id_length - prefix_len
+                self.metrics['collision_slots'] += 1
 
-            for tag in tags:
-                self.tag_response_counts[tag.id] += 1
+                b_i = collision_indices[0]
+                b_l = 1
+                for k in range(1, self.b_l_max):
+                    if (b_i + k) in collision_indices:
+                        b_l += 1
+                    else:
+                        break
 
-            self.qtcbb_b_i, self.qtcbb_b_l = self._get_collided_block_info(
-                [t.id for t in tags], self.qtcbb_prefix)
+                t_query = reader_bits / CONSTANTS.READER_BITS_PER_US
+                t_id = response_len / CONSTANTS.TAG_BITS_PER_US
+                time_base = t_query + CONSTANTS.T1_US + t_id + CONSTANTS.T2_MIN_US
 
-            self.current_mode = 'QTCBB_GET_BITMAP'
-            self.metrics['collision_slots'] += 1
+                bmreq_bits = 105
 
-            reader_bits = CONSTANTS.READER_CMD_BASE_BITS + prefix_len
-            tag_bits = len(tags) * remaining_len
-            return self._create_step_result('collision_slot', reader_bits, tag_bits, remaining_len)
+                mr_len = 2 ** b_l
 
-        elif self.current_mode == 'QTCBB_GET_BITMAP':
-            tags = self.qtcbb_task.tags_to_process
+                t_bmreq = bmreq_bits / CONSTANTS.READER_BITS_PER_US
+                t_mr = mr_len / CONSTANTS.TAG_BITS_PER_US
+                time_extra = t_bmreq + CONSTANTS.T1_US + t_mr + CONSTANTS.T2_MIN_US
 
-            if self.qtcbb_b_i == -1:
+                total_time_us = time_base + time_extra
 
-                self.current_mode = 'PROCESSING_PARTITIONS'
-                first_coll_pos, _ = RfidUtils.get_collision_info(
-                    [t.id for t in tags])
-                split_pos = len(first_coll_pos)
-                group_0 = [t for t in tags if t.id[split_pos] == '0']
-                group_1 = [t for t in tags if t.id[split_pos] == '1']
-                if group_1:
-                    self.task_stack.insert(0, EAQTask(tags_to_process=group_1))
-                if group_0:
-                    self.task_stack.insert(0, EAQTask(tags_to_process=group_0))
-                return self._create_step_result('internal_op', operation_description="Fallback to binary split.")
+                mr_responses = []
+                groups = {i: [] for i in range(mr_len)}
 
-            b_l_to_use = min(self.qtcbb_b_l, self.b_l)
-            bitmap_len = 2**b_l_to_use
+                for tag in active_tags:
 
-            aggregated_mrm = [0] * bitmap_len
-            for tag in tags:
-                self.tag_response_counts[tag.id] += 1
-                id_segment = tag.id[self.qtcbb_b_i: self.qtcbb_b_i + b_l_to_use]
-                aggregated_mrm[int(id_segment, 2)] = 1
+                    start = len(prefix) + b_i
+                    end = start + b_l
+                    if start >= len(tag.id):
+                        continue
 
-            for i in range(bitmap_len - 1, -1, -1):
-                if aggregated_mrm[i] == 1:
-                    child_suffix = format(i, f'0{b_l_to_use}b')
-                    new_prefix = (self.qtcbb_prefix +
-                                  tags[0].id[len(self.qtcbb_prefix):self.qtcbb_b_i] +
-                                  child_suffix)
-                    child_tags = [
-                        t for t in tags if t.id.startswith(new_prefix)]
-                    if child_tags:
-                        self.task_stack.insert(
-                            0, EAQTask(tags_to_process=child_tags))
+                    self.tag_response_counts[tag.id] += 1
+                    self.metrics['total_tag_responses'] += 1
 
-            reader_bits = CONSTANTS.READER_CMD_BASE_BITS + \
-                len(self.qtcbb_prefix) + 20
-            tag_bits = len(tags) * bitmap_len
+                    block_bits = tag.id[start: min(end, len(tag.id))]
+                    if len(block_bits) < b_l:
+                        block_bits = block_bits.ljust(b_l, '0')
+                    val = int(block_bits, 2)
 
-            self.metrics['collision_slots'] += 1
-            self.current_mode = 'PROCESSING_PARTITIONS'
-            return self._create_step_result('collision_slot', reader_bits, tag_bits, bitmap_len)
+                    groups[val].append(tag)
 
-        return self._create_step_result('internal_op', operation_description="Error: Unknown state.")
+                    mr_list = ['0'] * mr_len
+                    mr_list[val] = '1'
+                    mr_responses.append("".join(mr_list))
+
+                mixed_mr, _ = self.channel.resolve_collision_raw_strings(
+                    mr_responses)
+                active_indices = []
+                for idx, char in enumerate(mixed_mr):
+                    if char == '1' or char == 'X':
+                        active_indices.append(idx)
+
+                if not active_indices:
+
+                    self.task_stack.insert(0, current_state)
+                    return self._create_step_result('collision_slot', reader_bits, total_tag_bits, response_len,
+                                                    override_time_us=total_time_us, operation_description="Bitmap Error")
+
+                uncollided_segment = observed_signal[:b_i].replace('X', '0')
+
+                for idx in reversed(active_indices):
+
+                    block_suffix = format(idx, f'0{b_l}b')
+                    new_prefix = prefix + uncollided_segment + block_suffix
+                    self.task_stack.insert(0, EAQState(
+                        prefix=new_prefix, tags_in_subset=groups[idx]))
+
+                total_reader_bits_step = reader_bits + bmreq_bits
+
+                total_tag_bits_step = total_tag_bits + \
+                    (len(active_tags) * mr_len)
+
+                return self._create_step_result('collision_slot', total_reader_bits_step, total_tag_bits_step, response_len,
+                                                override_time_us=total_time_us, operation_description=f"QTCBB: Split {len(active_indices)}")
+
+        return self._create_step_result('internal_op')

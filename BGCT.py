@@ -2,17 +2,15 @@
 import math
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 
 from Framework import (
     TraditionalAlgorithmInterface,
     AlgorithmStepResult,
     Tag,
-    CONSTANTS,
-    apply_ber_noise
+    CONSTANTS
 )
-from Tool import RfidUtils
 
 
 @dataclass
@@ -23,12 +21,17 @@ class BGVCTState:
 class BGVCT_Algorithm(TraditionalAlgorithmInterface):
     def __init__(self, tags_in_field: List[Tag], **kwargs):
         super().__init__(tags_in_field, **kwargs)
+
         self.d_max = kwargs.get('d_max', 8)
         initial_state = BGVCTState(tags_to_identify=self.tags_in_field)
         self.query_stack: List[BGVCTState] = [initial_state]
         self.id_length = len(tags_in_field[0].id) if tags_in_field else 0
+
+        self.metrics['total_tag_responses'] = 0
+
         self.tag_response_counts: Dict[str, int] = {
             t.id: 0 for t in tags_in_field}
+
         self.current_mode = 'PLANNING_PHASE'
         self.tags_for_planning: List[Tag] = []
         self.planned_groups: List[List[Tag]] = []
@@ -50,22 +53,38 @@ class BGVCT_Algorithm(TraditionalAlgorithmInterface):
 
     def is_finished(self) -> bool:
         finished = len(self.identified_tags) == len(self.tags_in_field)
+
         if finished and 'avg_tag_responses' not in self.metrics:
-            counts = list(self.tag_response_counts.values())
-            self.metrics['avg_tag_responses'] = np.mean(
-                counts) if counts else 0
+            if self.total_tag_count > 0:
+                self.metrics['avg_tag_responses'] = self.metrics['total_tag_responses'] / \
+                    self.total_tag_count
+            else:
+                self.metrics['avg_tag_responses'] = 0
         return finished
 
-    def _get_collision_info_cost(self, tags_to_process: List[Tag]) -> AlgorithmStepResult:
+    @property
+    def total_tag_count(self):
+        return len(self.tags_in_field)
+
+    def _get_collision_info_cost(self, active_tags: List[Tag]) -> AlgorithmStepResult:
         self.metrics['collision_slots'] += 1
-        for tag in tags_to_process:
+
+        self.metrics['total_tag_responses'] += len(active_tags)
+        for tag in active_tags:
             self.tag_response_counts[tag.id] += 1
-        tag_ids = [t.id for t in tags_to_process]
-        common_prefix, _ = RfidUtils.get_collision_info(tag_ids)
-        prefix_len = len(common_prefix)
+
+        signal, _ = self.channel.resolve_collision(active_tags)
+
+        try:
+            first_collision_index = signal.index('X')
+            prefix_len = first_collision_index
+        except ValueError:
+            prefix_len = len(signal)
+
         remaining_len = self.id_length - prefix_len
         reader_bits_cost = CONSTANTS.READER_CMD_BASE_BITS + prefix_len
-        tag_bits_cost = len(tags_to_process) * remaining_len
+        tag_bits_cost = len(active_tags) * remaining_len
+
         return self._create_step_result('collision_slot', reader_bits=reader_bits_cost, tag_bits=tag_bits_cost,
                                         expected_max_tag_bits=remaining_len)
 
@@ -77,67 +96,81 @@ class BGVCT_Algorithm(TraditionalAlgorithmInterface):
                 return self._create_step_result('internal_op')
 
             current_state = self.query_stack.pop(0)
-            tags = [
+            candidate_tags = [
                 t for t in current_state.tags_to_identify if t.id not in self.identified_tags]
 
-            if not tags:
+            if not candidate_tags:
                 return self._create_step_result('internal_op')
 
-            if len(tags) == 1:
-                tag = tags[0]
+            active_tags = self.channel.filter_active_tags(candidate_tags)
+
+            if not active_tags:
+                self.metrics['idle_slots'] += 1
+                return self._create_step_result('idle_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS)
+
+            if len(active_tags) == 1:
+                tag = active_tags[0]
+
+                self.metrics['total_tag_responses'] += 1
                 self.tag_response_counts[tag.id] += 1
 
                 reader_bits = CONSTANTS.READER_CMD_BASE_BITS
                 tag_bits = self.id_length
 
-                perfect_response = tag.id
-                noisy_response = apply_ber_noise(perfect_response, self.ber)
+                received_signal, _ = self.channel.resolve_collision([tag])
 
-                if perfect_response == noisy_response:
+                if received_signal == tag.id:
                     self.identified_tags.add(tag.id)
                     self.metrics['success_slots'] += 1
                     return self._create_step_result('success_slot', reader_bits, tag_bits, tag_bits)
                 else:
-                    self.query_stack.insert(
-                        0, BGVCTState(tags_to_identify=tags))
+
+                    self.query_stack.insert(0, BGVCTState(
+                        tags_to_identify=candidate_tags))
                     self.metrics['collision_slots'] += 1
                     return self._create_step_result('collision_slot', reader_bits, tag_bits, tag_bits,
                                                     operation_description="Success slot failed due to BER")
 
-            self.tags_for_planning = tags
+            self.tags_for_planning = active_tags
             self.current_mode = 'AWAITING_PLANNING_DATA'
             return self._get_collision_info_cost(self.tags_for_planning)
 
         elif self.current_mode == 'AWAITING_PLANNING_DATA':
-            tags = self.tags_for_planning
-            tag_ids = [t.id for t in tags]
-            common_prefix, collision_positions = RfidUtils.get_collision_info(
-                tag_ids)
+            signal, collision_positions = self.channel.resolve_collision(
+                self.tags_for_planning)
             d_detected = len(collision_positions)
+
             if d_detected == 0:
-                if tags:
-                    for tag in tags:
-                        self.identified_tags.add(tag.id)
+
                 self.current_mode = 'PLANNING_PHASE'
                 return self._create_step_result('internal_op')
 
             d_to_use = min(d_detected, self.d_max)
             indices = np.linspace(0, d_detected - 1, d_to_use, dtype=int)
             positions_to_use = [collision_positions[i] for i in indices]
+
             groups = [[] for _ in range(2**d_to_use)]
-            for tag in tags:
-                groups[int("".join([tag.id[i]
-                           for i in positions_to_use]), 2)].append(tag)
+            for tag in self.tags_for_planning:
+                feature_str = "".join([tag.id[i] for i in positions_to_use])
+                group_idx = int(feature_str, 2)
+                groups[group_idx].append(tag)
 
             self.planned_groups = groups
             self.current_d_to_use = d_to_use
-            self.current_split_prefix_len = len(common_prefix)
+
+            try:
+                common_prefix_len = signal.index('X')
+            except ValueError:
+                common_prefix_len = len(signal)
+            self.current_split_prefix_len = common_prefix_len
+
             self.pending_cmd_reader_bits = CONSTANTS.READER_CMD_BASE_BITS + \
-                len(common_prefix) + 5 + d_to_use * 7
+                common_prefix_len + 5 + d_to_use * 7
             self.current_mode = 'PREDICTION_PHASE'
             return self._create_step_result('internal_op')
 
         elif self.current_mode == 'PREDICTION_PHASE':
+
             self.non_idle_groups = [g for g in self.planned_groups if g]
             if not self.non_idle_groups:
                 self.current_mode = 'PLANNING_PHASE'
@@ -150,45 +183,72 @@ class BGVCT_Algorithm(TraditionalAlgorithmInterface):
             self.pending_cmd_reader_bits = 0.0
 
             num_responding_tags = sum(len(g) for g in self.non_idle_groups)
+
+            self.metrics['total_tag_responses'] += num_responding_tags
+            for g in self.non_idle_groups:
+                for tag in g:
+                    self.tag_response_counts[tag.id] += 1
+
             return self._create_step_result('collision_slot', reader_bits=reader_bits,
                                             tag_bits=num_responding_tags,
                                             expected_max_tag_bits=bitmap_len)
 
         elif self.current_mode == 'EXECUTING_PHASE':
-            group = self.non_idle_groups[self.sub_slot_cursor]
+            candidate_group = self.non_idle_groups[self.sub_slot_cursor]
             self.sub_slot_cursor += 1
 
+            active_group = self.channel.filter_active_tags(candidate_group)
+
             result = None
-            if len(group) == 1:
-                tag = group[0]
+
+            if len(active_group) == 1:
+                tag = active_group[0]
+
+                self.metrics['total_tag_responses'] += 1
                 self.tag_response_counts[tag.id] += 1
 
                 reader_bits_cost = CONSTANTS.QUERYREP_CMD_BITS
                 remaining_len = self.id_length - self.current_split_prefix_len
 
-                perfect_response = tag.id[self.current_split_prefix_len:]
-                noisy_response = apply_ber_noise(perfect_response, self.ber)
+                perfect_fragment = tag.id[self.current_split_prefix_len:]
+                received_fragment, _ = self.channel.resolve_collision(
+                    [tag], bit_range=(self.current_split_prefix_len, self.id_length))
 
-                if perfect_response == noisy_response:
+                if perfect_fragment == received_fragment:
                     self.identified_tags.add(tag.id)
                     self.metrics['success_slots'] += 1
                     result = self._create_step_result('success_slot', reader_bits=reader_bits_cost,
                                                       tag_bits=remaining_len, expected_max_tag_bits=remaining_len)
                 else:
-                    self.query_stack.insert(
-                        0, BGVCTState(tags_to_identify=group))
+                    self.query_stack.insert(0, BGVCTState(
+                        tags_to_identify=candidate_group))
                     self.metrics['collision_slots'] += 1
                     result = self._create_step_result('collision_slot', reader_bits=reader_bits_cost,
                                                       tag_bits=remaining_len, expected_max_tag_bits=remaining_len,
                                                       operation_description="Exec success slot failed due to BER")
+
+            elif len(active_group) == 0:
+                self.metrics['idle_slots'] += 1
+                reader_bits_cost = CONSTANTS.QUERYREP_CMD_BITS
+                self.query_stack.insert(0, BGVCTState(
+                    tags_to_identify=candidate_group))
+                result = self._create_step_result(
+                    'idle_slot', reader_bits=reader_bits_cost)
+
             else:
-                self.query_stack.insert(0, BGVCTState(tags_to_identify=group))
+                self.query_stack.insert(0, BGVCTState(
+                    tags_to_identify=active_group))
                 self.metrics['collision_slots'] += 1
+
+                self.metrics['total_tag_responses'] += len(active_group)
+                for tag in active_group:
+                    self.tag_response_counts[tag.id] += 1
+
                 expected_bits = self.id_length - self.current_split_prefix_len
                 reader_bits_cost = CONSTANTS.QUERYREP_CMD_BITS
                 result = self._create_step_result('collision_slot', reader_bits=reader_bits_cost,
                                                   tag_bits=len(
-                                                      group) * expected_bits,
+                                                      active_group) * expected_bits,
                                                   expected_max_tag_bits=expected_bits)
 
             if self.sub_slot_cursor >= len(self.non_idle_groups):
@@ -212,41 +272,60 @@ class BGCT(BGVCT_Algorithm):
             return super().perform_step()
 
         if self.current_mode == 'PLANNING_PHASE':
+
             if not self.query_stack:
                 if not self.is_finished():
                     self.is_finished()
                 return self._create_step_result('internal_op')
 
             current_state = self.query_stack.pop(0)
-            tags = [
+            candidate_tags = [
                 t for t in current_state.tags_to_identify if t.id not in self.identified_tags]
 
-            if not tags:
+            if not candidate_tags:
                 return self._create_step_result('internal_op')
 
-            if len(tags) == 1:
+            active_tags = self.channel.filter_active_tags(candidate_tags)
 
-                tag = tags[0]
+            if not active_tags:
+                self.metrics['idle_slots'] += 1
+                return self._create_step_result('idle_slot', reader_bits=CONSTANTS.READER_CMD_BASE_BITS)
+
+            if len(active_tags) == 1:
+                tag = active_tags[0]
+
+                self.metrics['total_tag_responses'] += 1
                 self.tag_response_counts[tag.id] += 1
+
                 reader_bits = CONSTANTS.READER_CMD_BASE_BITS
                 tag_bits = self.id_length
-                perfect_response = tag.id
-                noisy_response = apply_ber_noise(perfect_response, self.ber)
-                if perfect_response == noisy_response:
+                received, _ = self.channel.resolve_collision([tag])
+
+                if received == tag.id:
                     self.identified_tags.add(tag.id)
                     self.metrics['success_slots'] += 1
                     return self._create_step_result('success_slot', reader_bits, tag_bits, tag_bits)
                 else:
                     self.query_stack.insert(
-                        0, BGVCTState(tags_to_identify=tags))
+                        0, BGVCTState(tags_to_identify=active_tags))
                     self.metrics['collision_slots'] += 1
                     return self._create_step_result('collision_slot', reader_bits, tag_bits, tag_bits,
-                                                    operation_description="Success slot failed due to BER")
+                                                    operation_description="Failed due to BER")
 
-            self.tags_for_planning = tags
-            tag_ids = [t.id for t in self.tags_for_planning]
-            common_prefix, _ = RfidUtils.get_collision_info(tag_ids)
-            self.probe_offset = len(common_prefix)
+            self.tags_for_planning = active_tags
+
+            signal, _ = self.channel.resolve_collision(self.tags_for_planning)
+
+            self.metrics['total_tag_responses'] += len(self.tags_for_planning)
+            for tag in self.tags_for_planning:
+                self.tag_response_counts[tag.id] += 1
+
+            try:
+                prefix_len = signal.index('X')
+            except ValueError:
+                prefix_len = len(signal)
+
+            self.probe_offset = prefix_len
             self.accumulated_positions = []
             self.current_mode = 'PROGRESSIVE_PROBE'
             return self._create_step_result('internal_op')
@@ -255,7 +334,6 @@ class BGCT(BGVCT_Algorithm):
             if self.probe_offset >= self.id_length or len(self.accumulated_positions) >= self.d_target:
                 return self._process_accumulated_info()
 
-            tag_ids = [t.id for t in self.tags_for_planning]
             start, end = self.probe_offset, min(
                 self.probe_offset + self.chunk_size, self.id_length)
             current_chunk_len = end - start
@@ -263,11 +341,8 @@ class BGCT(BGVCT_Algorithm):
             if current_chunk_len <= 0:
                 return self._process_accumulated_info()
 
-            perfect_chunks = [tid[start:end] for tid in tag_ids]
-            noisy_chunks = [apply_ber_noise(chunk, self.ber)
-                            for chunk in perfect_chunks]
-            _, chunk_collision_indices_rel = RfidUtils.get_collision_info(
-                noisy_chunks)
+            _, chunk_collision_indices_rel = self.channel.resolve_collision(
+                self.tags_for_planning, bit_range=(start, end))
 
             for rel_idx in chunk_collision_indices_rel:
                 abs_idx = start + rel_idx
@@ -277,6 +352,8 @@ class BGCT(BGVCT_Algorithm):
             self.probe_offset = end
 
             self.metrics['collision_slots'] += 1
+
+            self.metrics['total_tag_responses'] += len(self.tags_for_planning)
             for tag in self.tags_for_planning:
                 self.tag_response_counts[tag.id] += 1
 
@@ -289,17 +366,13 @@ class BGCT(BGVCT_Algorithm):
         return self._create_step_result('internal_op')
 
     def _process_accumulated_info(self) -> AlgorithmStepResult:
-        tags = self.tags_for_planning
-        tag_ids = [t.id for t in tags]
-        common_prefix, _ = RfidUtils.get_collision_info(tag_ids)
 
         collision_positions = self.accumulated_positions
         d_detected = len(collision_positions)
 
         if d_detected == 0:
-            if tags:
-                for tag in tags:
-                    self.identified_tags.add(tag.id)
+            if self.tags_for_planning:
+                pass
             self.current_mode = 'PLANNING_PHASE'
             return self._create_step_result('internal_op')
 
@@ -307,15 +380,17 @@ class BGCT(BGVCT_Algorithm):
         positions_to_use = collision_positions[:d_to_use]
 
         groups = [[] for _ in range(2**d_to_use)]
-        for tag in tags:
-            groups[int("".join([tag.id[i]
-                       for i in positions_to_use]), 2)].append(tag)
+        for tag in self.tags_for_planning:
+            feature_bits = [tag.id[i] for i in positions_to_use]
+            groups[int("".join(feature_bits), 2)].append(tag)
 
         self.planned_groups = groups
         self.current_d_to_use = d_to_use
-        self.current_split_prefix_len = len(common_prefix)
+
+        self.current_split_prefix_len = self.probe_offset
+
         self.pending_cmd_reader_bits = CONSTANTS.READER_CMD_BASE_BITS + \
-            len(common_prefix) + 5 + d_to_use * 7
+            self.current_split_prefix_len + 5 + d_to_use * 7
         self.current_mode = 'PREDICTION_PHASE'
 
         return self._create_step_result('internal_op')
