@@ -52,7 +52,7 @@ This project is developed in Python. It is recommended to use Anaconda or a Pyth
 
 Clone the repository
 
-git clone [https://github.com/your-username/Project_BGCT.git](https://github.com/your-username/Project_BGCT.git)
+git clone [https://github.com/ZoeLoveHGJ/Project_BGCT.git](https://github.com/ZoeLoveHGJ/Project_BGCT.git)
 cd Project_BGCT
 
 

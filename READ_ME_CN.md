@@ -52,7 +52,7 @@ Project_BGCT/
 
 克隆仓库
 
-git clone [https://github.com/your-username/Project_BGCT.git](https://github.com/your-username/Project_BGCT.git)
+git clone [https://github.com/ZoeLoveHGJ/Project_BGCT.git](https://github.com/ZoeLoveHGJ/Project_BGCT.git)
 cd Project_BGCT
 
 
